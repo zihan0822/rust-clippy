@@ -82,6 +82,7 @@ generate! {
     as_deref_mut,
     as_mut,
     as_path,
+    as_slice,
     assert_failed,
     author,
     borrow,

@@ -37,6 +37,7 @@ pub fn check<'tcx>(
     if let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
         && args.is_empty()
     {
+        check_to_owned_and_immediately_borrowed(cx, expr);
         if is_cloned_or_copied(cx, method_name, method_def_id) {
             unnecessary_iter_cloned::check(cx, expr, method_name, receiver);
         } else if is_to_owned_like(cx, expr, method_name, method_def_id) {
@@ -680,6 +681,47 @@ fn is_slice_and_vec(cx: &LateContext<'_>, arg_ty: Ty<'_>, original_arg_ty: Ty<'_
         && is_type_diagnostic_item(cx, arg_ty, sym::Vec)
 }
 
+fn check_to_owned_and_immediately_borrowed(cx: &LateContext<'_>, expr: &Expr<'_>) {
+    if let ExprKind::MethodCall(borrow_method_path, borrow_receiver, &[], _) = expr.kind
+        && let ExprKind::MethodCall(to_owned_method_path, to_owned_receiver, &[], _) = borrow_receiver.kind
+        && let Some(borrow_method_did) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
+        && let Some(to_owned_method_did) = cx.typeck_results().type_dependent_def_id(borrow_receiver.hir_id)
+    {
+        let (to_owned_method_name, borrow_method_name) =
+            (to_owned_method_path.ident.name, borrow_method_path.ident.name);
+        let useless_round_trip = match (to_owned_method_name, borrow_method_name) {
+            (sym::to_string, sym::as_str) => {
+                cx.tcx.is_diagnostic_item(sym::string_as_str, borrow_method_did)
+                    && cx.tcx.is_diagnostic_item(sym::to_string_method, to_owned_method_did)
+                    && cx.typeck_results().expr_ty(to_owned_receiver).peel_refs().is_str()
+            },
+            (sym::to_vec | sym::to_owned, sym::as_slice) => {
+                cx.tcx.is_diagnostic_item(sym::vec_as_slice, borrow_method_did)
+                    && cx.typeck_results().expr_ty(to_owned_receiver).peel_refs().is_slice()
+            },
+            _ => false,
+        };
+        if useless_round_trip {
+            span_lint_and_sugg(
+                cx,
+                UNNECESSARY_TO_OWNED,
+                expr.span.with_lo(to_owned_receiver.span.hi()),
+                format!("unnecessary use of `.{to_owned_method_name}().{borrow_method_name}()`"),
+                "remove this",
+                String::new(),
+                Applicability::MachineApplicable,
+            )
+        }
+    }
+}
+
+fn is_method_on_slice(cx: &LateContext<'_>, method_def_id: DefId) -> bool {
+    cx.tcx
+        .impl_of_method(method_def_id)
+        .filter(|&impl_did| cx.tcx.type_of(impl_did).instantiate_identity().is_slice())
+        .is_some()
+}
+
 // This function will check the following:
 // 1. The argument is a non-mutable reference.
 // 2. It calls `to_owned()`, `to_string()` or `to_vec()`.
@@ -692,11 +734,7 @@ fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx
         && match method_name {
             sym::to_owned => cx.tcx.is_diagnostic_item(sym::to_owned_method, method_def_id),
             sym::to_string => cx.tcx.is_diagnostic_item(sym::to_string_method, method_def_id),
-            sym::to_vec => cx
-                .tcx
-                .impl_of_method(method_def_id)
-                .filter(|&impl_did| cx.tcx.type_of(impl_did).instantiate_identity().is_slice())
-                .is_some(),
+            sym::to_vec => is_method_on_slice(cx, method_def_id),
             _ => false,
         }
         && let original_arg_ty = cx.typeck_results().node_type(caller.hir_id).peel_refs()
