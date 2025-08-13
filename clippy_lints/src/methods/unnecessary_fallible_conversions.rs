@@ -4,8 +4,8 @@ use clippy_utils::ty::implements_trait;
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::LateContext;
-use rustc_middle::ty;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
+use rustc_middle::ty::{self, Ty};
 use rustc_span::{Span, sym};
 
 use super::UNNECESSARY_FALLIBLE_CONVERSIONS;
@@ -27,6 +27,8 @@ enum FunctionKind {
     TryIntoMethod,
     /// `U::try_into(t)`
     TryIntoFunction(Option<SpansKind>),
+    /// `T::from_str(s)`
+    FromStrFunction(Option<SpansKind>),
 }
 
 impl FunctionKind {
@@ -48,7 +50,7 @@ impl FunctionKind {
 
     fn default_sugg(&self, primary_span: Span) -> Vec<(Span, String)> {
         let replacement = match *self {
-            FunctionKind::TryFromFunction(_) => "From::from",
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => "From::from",
             FunctionKind::TryIntoFunction(_) => "Into::into",
             FunctionKind::TryIntoMethod => "into",
         };
@@ -58,12 +60,16 @@ impl FunctionKind {
 
     fn machine_applicable_sugg(&self, primary_span: Span, unwrap_span: Span) -> Vec<(Span, String)> {
         let (trait_name, fn_name) = match self {
-            FunctionKind::TryFromFunction(_) => ("From".to_owned(), "from".to_owned()),
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => {
+                ("From".to_owned(), "from".to_owned())
+            },
             FunctionKind::TryIntoFunction(_) | FunctionKind::TryIntoMethod => ("Into".to_owned(), "into".to_owned()),
         };
 
         let mut sugg = match *self {
-            FunctionKind::TryFromFunction(Some(spans)) | FunctionKind::TryIntoFunction(Some(spans)) => match spans {
+            FunctionKind::TryFromFunction(Some(spans))
+            | FunctionKind::TryIntoFunction(Some(spans))
+            | FunctionKind::FromStrFunction(Some(spans)) => match spans {
                 SpansKind::TraitFn { trait_span, fn_span } => vec![(trait_span, trait_name), (fn_span, fn_name)],
                 SpansKind::Fn { fn_span } => vec![(fn_span, fn_name)],
             },
@@ -89,7 +95,7 @@ fn check<'tcx>(
         && self_ty != other_ty
         && let Some(self_ty) = self_ty.as_type()
         && let Some(from_into_trait) = cx.tcx.get_diagnostic_item(match kind {
-            FunctionKind::TryFromFunction(_) => sym::From,
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => sym::From,
             FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) => sym::Into,
         })
         // If `T: TryFrom<U>` and `T: From<U>` both exist, then that means that the `TryFrom`
@@ -125,7 +131,7 @@ fn check<'tcx>(
 
         let (source_ty, target_ty) = match kind {
             FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) => (self_ty, other_ty),
-            FunctionKind::TryFromFunction(_) => (other_ty, self_ty),
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => (other_ty, self_ty),
         };
 
         let (applicability, sugg) = kind.appl_sugg(parent_unwrap_call, primary_span);
@@ -183,17 +189,23 @@ pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Exp
             }),
             QPath::LangItem(_, _) => unreachable!("`TryFrom` and `TryInto` are not lang items"),
         };
-
-        check(
-            cx,
-            expr,
-            cx.typeck_results().node_args(callee.hir_id),
-            match cx.tcx.get_diagnostic_name(trait_def_id) {
+        let node_args = cx.typeck_results().node_args(callee.hir_id);
+        let (func_kind, node_args) = if cx.tcx.is_diagnostic_item(sym::from_str_method, item_def_id) {
+            let str_ref_ty = Ty::new_imm_ref(cx.tcx, cx.tcx.lifetimes.re_erased, cx.tcx.types.str_);
+            (
+                FunctionKind::FromStrFunction(qpath_spans),
+                cx.tcx
+                    .mk_args_from_iter(node_args.iter().chain(std::iter::once(str_ref_ty.into()))),
+            )
+        } else {
+            let from_into_function = match cx.tcx.get_diagnostic_name(trait_def_id) {
                 Some(sym::TryFrom) => FunctionKind::TryFromFunction(qpath_spans),
                 Some(sym::TryInto) => FunctionKind::TryIntoFunction(qpath_spans),
                 _ => return,
-            },
-            callee.span,
-        );
+            };
+            (from_into_function, node_args)
+        };
+
+        check(cx, expr, node_args, func_kind, callee.span);
     }
 }
