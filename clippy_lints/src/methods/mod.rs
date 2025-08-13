@@ -5445,6 +5445,7 @@ impl Methods {
                 (sym::try_into, []) if is_trait_method(cx, expr, sym::TryInto) => {
                     unnecessary_fallible_conversions::check_method(cx, expr);
                 },
+                (sym::parse, []) => unnecessary_fallible_conversions::check_method(cx, expr),
                 (sym::to_owned, []) => {
                     if !suspicious_to_owned::check(cx, expr, recv) {
                         implicit_clone::check(cx, name, expr, recv);

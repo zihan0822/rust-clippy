@@ -1,12 +1,15 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::get_parent_expr;
+use clippy_utils::source::{SpanRangeExt, snippet};
 use clippy_utils::ty::implements_trait;
+use clippy_utils::{get_parent_expr, sym};
 use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::LateContext;
+use rustc_middle::ty::adjustment::Adjust;
 use rustc_middle::ty::print::with_forced_trimmed_paths;
-use rustc_middle::ty::{self, Ty};
-use rustc_span::{Span, sym};
+use rustc_middle::ty::{GenericArgsRef, Ty};
+
+use rustc_span::Span;
 
 use super::UNNECESSARY_FALLIBLE_CONVERSIONS;
 
@@ -20,7 +23,7 @@ enum SpansKind {
 /// call
 #[derive(Copy, Clone)]
 #[expect(clippy::enum_variant_names)]
-enum FunctionKind {
+enum FunctionKind<'tcx> {
     /// `T::try_from(U)`
     TryFromFunction(Option<SpansKind>),
     /// `t.try_into()`
@@ -29,28 +32,38 @@ enum FunctionKind {
     TryIntoFunction(Option<SpansKind>),
     /// `T::from_str(s)`
     FromStrFunction(Option<SpansKind>),
+    /// `s.parse::<U>()`
+    /// Contains (receiver, target type)
+    StrParseMethod(&'tcx Expr<'tcx>, Ty<'tcx>),
 }
 
-impl FunctionKind {
-    fn appl_sugg(&self, parent_unwrap_call: Option<Span>, primary_span: Span) -> (Applicability, Vec<(Span, String)>) {
+impl FunctionKind<'_> {
+    fn appl_sugg(
+        &self,
+        cx: &LateContext<'_>,
+        parent_unwrap_call: Option<Span>,
+        primary_span: Span,
+    ) -> (Applicability, Vec<(Span, String)>) {
         let Some(unwrap_span) = parent_unwrap_call else {
             return (Applicability::Unspecified, self.default_sugg(primary_span));
         };
 
         match &self {
-            FunctionKind::TryFromFunction(None) | FunctionKind::TryIntoFunction(None) => {
-                (Applicability::Unspecified, self.default_sugg(primary_span))
-            },
+            FunctionKind::TryFromFunction(None)
+            | FunctionKind::TryIntoFunction(None)
+            | FunctionKind::FromStrFunction(None) => (Applicability::Unspecified, self.default_sugg(primary_span)),
             _ => (
                 Applicability::MachineApplicable,
-                self.machine_applicable_sugg(primary_span, unwrap_span),
+                self.machine_applicable_sugg(cx, primary_span, unwrap_span),
             ),
         }
     }
 
     fn default_sugg(&self, primary_span: Span) -> Vec<(Span, String)> {
         let replacement = match *self {
-            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => "From::from",
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) | FunctionKind::StrParseMethod(..) => {
+                "From::from"
+            },
             FunctionKind::TryIntoFunction(_) => "Into::into",
             FunctionKind::TryIntoMethod => "into",
         };
@@ -58,9 +71,14 @@ impl FunctionKind {
         vec![(primary_span, String::from(replacement))]
     }
 
-    fn machine_applicable_sugg(&self, primary_span: Span, unwrap_span: Span) -> Vec<(Span, String)> {
+    fn machine_applicable_sugg(
+        &self,
+        cx: &LateContext<'_>,
+        primary_span: Span,
+        unwrap_span: Span,
+    ) -> Vec<(Span, String)> {
         let (trait_name, fn_name) = match self {
-            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => {
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) | FunctionKind::StrParseMethod(..) => {
                 ("From".to_owned(), "from".to_owned())
             },
             FunctionKind::TryIntoFunction(_) | FunctionKind::TryIntoMethod => ("Into".to_owned(), "into".to_owned()),
@@ -74,6 +92,21 @@ impl FunctionKind {
                 SpansKind::Fn { fn_span } => vec![(fn_span, fn_name)],
             },
             FunctionKind::TryIntoMethod => vec![(primary_span, fn_name)],
+            FunctionKind::StrParseMethod(receiver, target_ty) => {
+                let adjustments = cx.typeck_results().expr_adjustments(receiver);
+                let deref_count = adjustments
+                    .iter()
+                    .take_while(|adj| matches!(adj.kind, Adjust::Deref(_)))
+                    .count();
+                let prefix = if deref_count == 0 {
+                    ""
+                } else {
+                    &format!("&{:*>deref_count$}", "")
+                };
+                let receiver_snippet = receiver.span.get_source_text(cx).unwrap();
+                let from_call = format!("{}::from({prefix}{receiver_snippet})", target_ty.to_string());
+                vec![(primary_span, from_call)]
+            },
             // Or the suggestion is not machine-applicable
             _ => unreachable!(),
         };
@@ -81,13 +114,24 @@ impl FunctionKind {
         sugg.push((unwrap_span, String::new()));
         sugg
     }
+
+    fn mk_args<'tcx>(&self, cx: &LateContext<'tcx>, node_args: GenericArgsRef<'tcx>) -> GenericArgsRef<'tcx> {
+        match self {
+            FunctionKind::FromStrFunction(_) | FunctionKind::StrParseMethod(..) => {
+                let str_ref_ty = Ty::new_imm_ref(cx.tcx, cx.tcx.lifetimes.re_erased, cx.tcx.types.str_);
+                cx.tcx
+                    .mk_args_from_iter(node_args.iter().chain(std::iter::once(str_ref_ty.into())))
+            },
+            _ => node_args,
+        }
+    }
 }
 
 fn check<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &Expr<'_>,
-    node_args: ty::GenericArgsRef<'tcx>,
-    kind: FunctionKind,
+    node_args: GenericArgsRef<'tcx>,
+    kind: FunctionKind<'_>,
     primary_span: Span,
 ) {
     if let &[self_ty, other_ty] = node_args.as_slice()
@@ -95,7 +139,8 @@ fn check<'tcx>(
         && self_ty != other_ty
         && let Some(self_ty) = self_ty.as_type()
         && let Some(from_into_trait) = cx.tcx.get_diagnostic_item(match kind {
-            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => sym::From,
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) |
+                FunctionKind::StrParseMethod(..) => sym::From,
             FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) => sym::Into,
         })
         // If `T: TryFrom<U>` and `T: From<U>` both exist, then that means that the `TryFrom`
@@ -131,10 +176,12 @@ fn check<'tcx>(
 
         let (source_ty, target_ty) = match kind {
             FunctionKind::TryIntoMethod | FunctionKind::TryIntoFunction(_) => (self_ty, other_ty),
-            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) => (other_ty, self_ty),
+            FunctionKind::TryFromFunction(_) | FunctionKind::FromStrFunction(_) | FunctionKind::StrParseMethod(..) => {
+                (other_ty, self_ty)
+            },
         };
 
-        let (applicability, sugg) = kind.appl_sugg(parent_unwrap_call, primary_span);
+        let (applicability, sugg) = kind.appl_sugg(cx, parent_unwrap_call, primary_span);
 
         span_lint_and_then(
             cx,
@@ -153,15 +200,20 @@ fn check<'tcx>(
 
 /// Checks method call exprs:
 /// - `0i32.try_into()`
-pub(super) fn check_method(cx: &LateContext<'_>, expr: &Expr<'_>) {
-    if let ExprKind::MethodCall(path, ..) = expr.kind {
-        check(
-            cx,
-            expr,
-            cx.typeck_results().node_args(expr.hir_id),
-            FunctionKind::TryIntoMethod,
-            path.ident.span,
-        );
+/// - `s.parse()`
+pub(super) fn check_method<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) {
+    if let ExprKind::MethodCall(path, receiver, ..) = expr.kind {
+        let node_args = cx.typeck_results().node_args(expr.hir_id);
+        let (kind, span) =
+            if path.ident.name == sym::parse && cx.typeck_results().expr_ty_adjusted(receiver).peel_refs().is_str() {
+                let Some(target_ty) = node_args.first().and_then(|arg| arg.as_type()) else {
+                    return;
+                };
+                (FunctionKind::StrParseMethod(receiver, target_ty), expr.span)
+            } else {
+                (FunctionKind::TryIntoMethod, path.ident.span)
+            };
+        check(cx, expr, kind.mk_args(cx, node_args), kind, span);
     }
 }
 
@@ -189,22 +241,16 @@ pub(super) fn check_function(cx: &LateContext<'_>, expr: &Expr<'_>, callee: &Exp
             }),
             QPath::LangItem(_, _) => unreachable!("`TryFrom` and `TryInto` are not lang items"),
         };
-        let node_args = cx.typeck_results().node_args(callee.hir_id);
-        let (func_kind, node_args) = if cx.tcx.is_diagnostic_item(sym::from_str_method, item_def_id) {
-            let str_ref_ty = Ty::new_imm_ref(cx.tcx, cx.tcx.lifetimes.re_erased, cx.tcx.types.str_);
-            (
-                FunctionKind::FromStrFunction(qpath_spans),
-                cx.tcx
-                    .mk_args_from_iter(node_args.iter().chain(std::iter::once(str_ref_ty.into()))),
-            )
+        let func_kind = if cx.tcx.is_diagnostic_item(sym::from_str_method, item_def_id) {
+            FunctionKind::FromStrFunction(qpath_spans)
         } else {
-            let from_into_function = match cx.tcx.get_diagnostic_name(trait_def_id) {
+            match cx.tcx.get_diagnostic_name(trait_def_id) {
                 Some(sym::TryFrom) => FunctionKind::TryFromFunction(qpath_spans),
                 Some(sym::TryInto) => FunctionKind::TryIntoFunction(qpath_spans),
                 _ => return,
-            };
-            (from_into_function, node_args)
+            }
         };
+        let node_args = func_kind.mk_args(cx, cx.typeck_results().node_args(callee.hir_id));
 
         check(cx, expr, node_args, func_kind, callee.span);
     }
