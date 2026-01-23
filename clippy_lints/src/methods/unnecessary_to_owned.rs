@@ -664,34 +664,29 @@ fn is_to_string_on_string_like<'a>(
     }
 }
 
-fn std_map_key<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
-    match ty.kind() {
-        ty::Adt(adt, args)
-            if matches!(
-                cx.tcx.get_diagnostic_name(adt.did()),
-                Some(sym::BTreeMap | sym::BTreeSet | sym::HashMap | sym::HashSet)
-            ) =>
-        {
-            Some(args.type_at(0))
-        },
-        _ => None,
+fn check_borrow_predicate<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) {
+    if let ExprKind::MethodCall(_, _, &[arg], _) = expr.kind
+        && let Some(method_did) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
+        && let Some(borrow_did) = cx.tcx.get_diagnostic_item(sym::Borrow)
+        && let Some((k, _)) = has_getter_like_api(cx, method_did, borrow_did)
+        && let Some(node_args) = cx.typeck_results().node_args_opt(expr.hir_id)
+    {
+        let key_ty = node_args.type_at(k.index as usize);
+        check_if_applicable_to_getter_argument(cx, &arg, key_ty, borrow_did);
     }
 }
 
-fn is_str_and_string(cx: &LateContext<'_>, arg_ty: Ty<'_>, original_arg_ty: Ty<'_>) -> bool {
-    original_arg_ty.is_str() && arg_ty.is_lang_item(cx, LangItem::String)
-}
-
-fn is_slice_and_vec(cx: &LateContext<'_>, arg_ty: Ty<'_>, original_arg_ty: Ty<'_>) -> bool {
-    (original_arg_ty.is_slice() || original_arg_ty.is_array() || original_arg_ty.is_array_slice())
-        && arg_ty.is_diag_item(cx, sym::Vec)
-}
-
-// This function will check the following:
-// 1. The argument is a non-mutable reference.
-// 2. It calls `to_owned()`, `to_string()` or `to_vec()`.
-// 3. That the method is called on `String` or on `Vec` (only types supported for the moment).
-fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx>) {
+/// This function will check the following:
+/// 1. The argument is a non-mutable reference.
+/// 2. It calls `to_owned()`, `to_string()` or `to_vec()`.
+/// 3. The receiver of to-owned-like method satisfies K: Borrow<Q> where K = `key_ty`, Q =
+///    `receiver_ty` (Q can be further unsized into slice if it's an array)
+fn check_if_applicable_to_getter_argument<'tcx>(
+    cx: &LateContext<'tcx>,
+    arg: &Expr<'tcx>,
+    key_ty: Ty<'tcx>,
+    borrow_did: DefId,
+) {
     if let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, expr) = arg.kind
         && let ExprKind::MethodCall(method_path, caller, &[], _) = expr.kind
         && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
@@ -707,13 +702,8 @@ fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx
             _ => false,
         }
         && let original_arg_ty = cx.typeck_results().node_type(caller.hir_id).peel_refs()
-        && let arg_ty = cx.typeck_results().expr_ty(arg)
-        && let ty::Ref(_, arg_ty, Mutability::Not) = arg_ty.kind()
-        // FIXME: try to fix `can_change_type` to make it work in this case.
-        // && can_change_type(cx, caller, *arg_ty)
-        && let arg_ty = arg_ty.peel_refs()
-        // For now we limit this lint to `String` and `Vec`.
-        && (is_str_and_string(cx, arg_ty, original_arg_ty) || is_slice_and_vec(cx, arg_ty, original_arg_ty))
+        && matches!(cx.typeck_results().expr_ty(arg).kind(), ty::Ref(_, _, Mutability::Not))
+        && implements_borrow_with_array_unsize_fallback(cx, key_ty, borrow_did, original_arg_ty)
         && let Some(snippet) = caller.span.get_source_text(cx)
     {
         span_lint_and_sugg(
@@ -732,33 +722,59 @@ fn check_if_applicable_to_argument<'tcx>(cx: &LateContext<'tcx>, arg: &Expr<'tcx
     }
 }
 
-// In std "map types", the getters all expect a `Borrow<Key>` generic argument. So in here, we
-// check that:
-// 1. This is a method with only one argument that doesn't come from a trait.
-// 2. That it has `Borrow` in its generic predicates.
-// 3. `Self` is a std "map type" (ie `HashSet`, `HashMap`, `BTreeSet`, `BTreeMap`).
-// 4. The key to the "map type" is not a reference.
-fn check_borrow_predicate<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) {
-    if let ExprKind::MethodCall(_, caller, &[arg], _) = expr.kind
-        && let Some(method_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
-        && cx.tcx.trait_of_assoc(method_def_id).is_none()
-        && let Some(borrow_id) = cx.tcx.get_diagnostic_item(sym::Borrow)
-        && cx.tcx.predicates_of(method_def_id).predicates.iter().any(|(pred, _)| {
-            if let ClauseKind::Trait(trait_pred) = pred.kind().skip_binder()
-                && trait_pred.polarity == ty::PredicatePolarity::Positive
-                && trait_pred.trait_ref.def_id == borrow_id
-            {
-                true
-            } else {
-                false
-            }
-        })
-        && let caller_ty = cx.typeck_results().expr_ty(caller)
-        // For now we limit it to "map types".
-        && let Some(key_ty) = std_map_key(cx, caller_ty)
-        // We need to check that the key type is not a reference.
-        && !key_ty.is_ref()
+/// Find method calls with map getter like api
+/// We check that:
+/// 1. It has `Borrow` in its generic predicates, i.e. K: Borrow<Q>.
+/// 2. It has only one argument with type &Q.
+fn has_getter_like_api(cx: &LateContext<'_>, did: DefId, borrow_did: DefId) -> Option<(ParamTy, ParamTy)> {
+    let (k, q) = find_param_ty_with_borrow_predicate(cx, did, borrow_did)?;
+    let sig = cx.tcx.fn_sig(did).instantiate_identity().skip_binder();
+    let inputs = sig.inputs();
+    if inputs.len() != 2 {
+        return None;
+    }
+    if let ty::Ref(_, referent_ty, _) = inputs[1].kind()
+        && let ty::Param(referent_ty) = referent_ty.kind()
+        && q == *referent_ty
     {
-        check_if_applicable_to_argument(cx, &arg);
+        Some((k, q))
+    } else {
+        None
+    }
+}
+
+fn find_param_ty_with_borrow_predicate<'ctx>(
+    cx: &LateContext<'ctx>,
+    did: DefId,
+    borrow_did: DefId,
+) -> Option<(ParamTy, ParamTy)> {
+    cx.tcx.predicates_of(did).predicates.iter().find_map(|(pred, _)| {
+        if let ClauseKind::Trait(TraitPredicate { trait_ref, polarity }) = pred.kind().skip_binder()
+            && polarity == ty::PredicatePolarity::Positive
+            && trait_ref.def_id == borrow_did
+            && let (ty::Param(k), ty::Param(q)) = (trait_ref.self_ty().kind(), trait_ref.args.type_at(1).kind())
+        {
+            Some((*k, *q))
+        } else {
+            None
+        }
+    })
+}
+
+fn implements_borrow_with_array_unsize_fallback<'tcx>(
+    cx: &LateContext<'tcx>,
+    ty: Ty<'tcx>,
+    borrow_did: DefId,
+    borrow_target_ty: Ty<'tcx>,
+) -> bool {
+    if implements_trait(cx, ty, borrow_did, &[borrow_target_ty.into()]) {
+        return true;
+    }
+    if let ty::Array(elem_ty, _) = borrow_target_ty.kind()
+        && implements_trait(cx, ty, borrow_did, &[Ty::new_slice(cx.tcx, *elem_ty).into()])
+    {
+        true
+    } else {
+        false
     }
 }

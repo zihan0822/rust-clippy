@@ -556,5 +556,23 @@ error: unnecessary use of `to_string`
 LL |     take(format!("ouch{dot}").to_string());
    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `&format!("ouch{dot}")`
 
-error: aborting due to 83 previous errors
+error: unnecessary use of `to_string`
+  --> tests/ui/unnecessary_to_owned.rs:718:39
+   |
+LL |     CustomSet::<String>::new().remove(&"foo".to_string());
+   |                                       ^^^^^^^^^^^^^^^^^^ help: replace it with: `"foo"`
+
+error: unnecessary use of `to_vec`
+  --> tests/ui/unnecessary_to_owned.rs:720:43
+   |
+LL |     CustomSet::<Vec<usize>>::new().remove(&[1].to_vec());
+   |                                           ^^^^^^^^^^^^^ help: replace it with: `[1].as_slice()`
+
+error: unnecessary use of `to_owned`
+  --> tests/ui/unnecessary_to_owned.rs:722:39
+   |
+LL |     CustomSet::<String>::new().remove(&"foo".to_owned());
+   |                                       ^^^^^^^^^^^^^^^^^ help: replace it with: `"foo"`
+
+error: aborting due to 86 previous errors
 
