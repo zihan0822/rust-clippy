@@ -132,7 +132,7 @@ declare_clippy_lint! {
 declare_clippy_lint! {
     /// ### What it does
     ///
-    /// In CommonMark Markdown, the language used to write doc comments, a
+    /// In `CommonMark` Markdown, the language used to write doc comments, a
     /// paragraph nested within a list or block quote does not need any line
     /// after the first one to be indented or marked. The specification calls
     /// this a "lazy paragraph continuation."
@@ -265,7 +265,6 @@ declare_clippy_lint! {
     /// /// Consume the array and return the inner
     /// /// [`SmallVec<[T; INLINE_CAPACITY]>`][SmallVec].
     /// /// [SmallVec]: SmallVec
-    /// fn main() {}
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub DOC_MARKDOWN,

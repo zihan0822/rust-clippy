@@ -100,7 +100,7 @@ declare_clippy_lint! {
     /// annotation, one will be forced to re-visit the decision to ignore the value in such cases.
     ///
     /// ### Known problems
-    /// The `_ = <expr>` is not properly supported by some tools (e.g. IntelliJ) and may seem odd
+    /// The `_ = <expr>` is not properly supported by some tools (e.g. `IntelliJ`) and may seem odd
     /// to many developers. This lint also partially overlaps with the other `let_underscore_*`
     /// lints.
     ///
